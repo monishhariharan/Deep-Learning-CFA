@@ -17,6 +17,7 @@ Models compared
 Outputs
 -------
   · model_comparison.png  — 6-panel dashboard
+  · model_backtests.png   — equity curves + Sharpe / max drawdown
   · Console table: accuracy, AUC, edge per model per stock
 
 Usage
@@ -415,12 +416,19 @@ class GRU:
 # ═════════════════════════════════════════════════════════════════════════════
 
 SEQ_LEN    = 20   # timesteps for LSTM / GRU
+LOOKBACK   = 20   # feature lookback window
 HIDDEN     = 32   # recurrent hidden units
 FFNN_ARCH  = [7, 64, 32, 1]
 
 
 def run_stock(ticker, df, epochs):
-    X_flat, y_flat = build_features(df)
+    close = df["Close"].values.astype(float)
+    log_ret = np.diff(np.log(close))
+    # Align future returns with labels produced by build_features:
+    # label at t uses return at t+1, with LOOKBACK warmup.
+    future_ret = log_ret[LOOKBACK + 1 :]
+
+    X_flat, y_flat = build_features(df, lookback=LOOKBACK)
     if len(y_flat) < SEQ_LEN + 120:
         print(f"  {ticker}: not enough data — skipping.")
         return None
@@ -429,6 +437,7 @@ def run_stock(ticker, df, epochs):
     split_f = int(len(y_flat) * 0.8)
     X_tr_f, X_te_f = X_flat[:split_f], X_flat[split_f:]
     y_tr_f, y_te_f = y_flat[:split_f], y_flat[split_f:]
+    ret_te_f       = future_ret[split_f:]
     sc = StandardScaler()
     X_tr_fs = sc.fit_transform(X_tr_f)
     X_te_fs  = sc.transform(X_te_f)
@@ -438,6 +447,8 @@ def run_stock(ticker, df, epochs):
     split_s = int(len(y_seq) * 0.8)
     X_tr_s, X_te_s = X_seq[:split_s], X_seq[split_s:]
     y_tr_s, y_te_s = y_seq[:split_s], y_seq[split_s:]
+    ret_seq        = future_ret[SEQ_LEN:]
+    ret_te_s       = ret_seq[split_s:]
     sc2 = StandardScaler()
     N, T, Fv = X_tr_s.shape
     X_tr_ss  = sc2.fit_transform(X_tr_s.reshape(-1, Fv)).reshape(N, T, Fv)
@@ -461,28 +472,38 @@ def run_stock(ticker, df, epochs):
     m_p.fit(X_tr_fs, y_tr_f)
     acc, auc, pred, prob = _metrics(m_p, X_te_fs, y_te_f)
     results["Perceptron"] = dict(acc=acc, auc=auc, edge=acc-baseline_f,
-                                  y_te=y_te_f, y_pred=pred, y_prob=prob)
+                                  y_te=y_te_f, y_pred=pred, y_prob=prob,
+                                  backtest=None)  # placeholder, filled below
 
     # ── FFNN ─────────────────────────────────────────────────────────────────
     m_f = FFNN(FFNN_ARCH, lr=0.01, momentum=0.9, epochs=epochs, batch_size=32)
     m_f.fit(X_tr_fs, y_tr_f)
     acc, auc, pred, prob = _metrics(m_f, X_te_fs, y_te_f)
     results["FFNN"] = dict(acc=acc, auc=auc, edge=acc-baseline_f,
-                            y_te=y_te_f, y_pred=pred, y_prob=prob)
+                            y_te=y_te_f, y_pred=pred, y_prob=prob,
+                            backtest=None)
 
     # ── LSTM ─────────────────────────────────────────────────────────────────
     m_l = LSTM(Fv, HIDDEN, SEQ_LEN, lr=0.005, epochs=epochs, batch_size=32, clip=5.0)
     m_l.fit(X_tr_ss, y_tr_s)
     acc, auc, pred, prob = _metrics(m_l, X_te_ss, y_te_s)
     results["LSTM"] = dict(acc=acc, auc=auc, edge=acc-baseline_s,
-                            y_te=y_te_s, y_pred=pred, y_prob=prob)
+                            y_te=y_te_s, y_pred=pred, y_prob=prob,
+                            backtest=None)
 
     # ── GRU ──────────────────────────────────────────────────────────────────
     m_g = GRU(Fv, HIDDEN, SEQ_LEN, lr=0.005, epochs=epochs, batch_size=32, clip=5.0)
     m_g.fit(X_tr_ss, y_tr_s)
     acc, auc, pred, prob = _metrics(m_g, X_te_ss, y_te_s)
     results["GRU"] = dict(acc=acc, auc=auc, edge=acc-baseline_s,
-                           y_te=y_te_s, y_pred=pred, y_prob=prob)
+                           y_te=y_te_s, y_pred=pred, y_prob=prob,
+                           backtest=None)
+
+    # ── Backtests (long/flat vs buy-and-hold) ────────────────────────────────
+    results["Perceptron"]["backtest"] = backtest_metrics(results["Perceptron"]["y_pred"], ret_te_f)
+    results["FFNN"]["backtest"]       = backtest_metrics(results["FFNN"]["y_pred"], ret_te_f)
+    results["LSTM"]["backtest"]       = backtest_metrics(results["LSTM"]["y_pred"], ret_te_s)
+    results["GRU"]["backtest"]        = backtest_metrics(results["GRU"]["y_pred"], ret_te_s)
 
     return dict(ticker=ticker, results=results,
                 baseline_f=baseline_f, baseline_s=baseline_s)
@@ -501,6 +522,58 @@ def equity_curve(y_pred, y_true_ret):
     n = min(len(y_pred), len(y_true_ret))
     strategy = y_pred[:n] * y_true_ret[:n]   # only take long positions
     return np.exp(np.cumsum(strategy))
+
+
+def buy_hold_curve(y_true_ret):
+    return np.exp(np.cumsum(y_true_ret))
+
+
+def sharpe_ratio(returns):
+    if len(returns) == 0:
+        return float("nan")
+    vol = returns.std()
+    if vol < 1e-12:
+        return 0.0
+    return float((returns.mean() / vol) * np.sqrt(252))
+
+
+def max_drawdown(equity):
+    if len(equity) == 0:
+        return float("nan")
+    peaks = np.maximum.accumulate(equity)
+    dd = (equity - peaks) / peaks
+    return float(dd.min())
+
+
+def backtest_metrics(y_pred, y_true_ret):
+    """
+    Compute long/flat strategy metrics against buy-and-hold.
+    """
+    n = min(len(y_pred), len(y_true_ret))
+    if n == 0:
+        return dict(
+            returns=np.array([]),
+            benchmark_returns=np.array([]),
+            equity=np.array([]),
+            buy_hold=np.array([]),
+            sharpe=float("nan"),
+            max_drawdown=float("nan"),
+            final=1.0,
+            benchmark_final=1.0,
+        )
+    strategy_ret = y_pred[:n] * y_true_ret[:n]
+    equity = np.exp(np.cumsum(strategy_ret))
+    buy_hold = np.exp(np.cumsum(y_true_ret[:n]))
+    return dict(
+        returns=strategy_ret,
+        benchmark_returns=y_true_ret[:n],
+        equity=equity,
+        buy_hold=buy_hold,
+        sharpe=sharpe_ratio(strategy_ret),
+        max_drawdown=max_drawdown(equity),
+        final=float(equity[-1]),
+        benchmark_final=float(buy_hold[-1]),
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -639,6 +712,75 @@ def plot_comparison(all_stocks, out_path="model_comparison.png"):
     print(f"\n  Dashboard saved → {out_path}")
 
 
+def plot_backtests(all_stocks, out_path="model_backtests.png"):
+    if not all_stocks:
+        return
+
+    fig, (ax_eq, ax_txt) = plt.subplots(1, 2, figsize=(14, 5))
+    ax_eq.set_title("Average Equity Curves (long/flat signal)")
+    ax_eq.set_xlabel("Test days")
+    ax_eq.set_ylabel("Cumulative equity (×)")
+
+    agg_metrics = {}
+    avg_bh_curve = None
+
+    for name, color in zip(MODEL_NAMES, MODEL_COLORS):
+        eqs, bhs, sharpes, mdds, finals = [], [], [], [], []
+        for stock in all_stocks:
+            bt = stock["results"][name].get("backtest")
+            if not bt or len(bt["equity"]) == 0:
+                continue
+            eqs.append(bt["equity"])
+            bhs.append(bt["buy_hold"])
+            sharpes.append(bt["sharpe"])
+            mdds.append(bt["max_drawdown"])
+            finals.append(bt["final"])
+        if not eqs:
+            continue
+        min_len = min(len(e) for e in eqs)
+        mean_eq = np.mean([e[:min_len] for e in eqs], axis=0)
+        mean_bh = np.mean([b[:min_len] for b in bhs], axis=0)
+        if avg_bh_curve is None:
+            avg_bh_curve = mean_bh
+        ax_eq.plot(mean_eq, label=name, color=color, lw=2)
+        agg_metrics[name] = dict(
+            sharpe=np.nanmean(sharpes) if sharpes else float("nan"),
+            mdd=np.nanmean(mdds) if mdds else float("nan"),
+            final=np.nanmean(finals) if finals else float("nan"),
+            bh_final=float(mean_bh[-1]) if len(mean_bh) else float("nan"),
+        )
+
+    if avg_bh_curve is not None:
+        ax_eq.plot(avg_bh_curve, label="Buy & Hold", color="black",
+                   ls="--", lw=1.8)
+    ax_eq.legend(fontsize=9)
+    ax_eq.grid(alpha=0.3)
+
+    ax_txt.axis("off")
+    lines = [
+        f"{'Model':<12} {'Sharpe':>8} {'MaxDD':>9} {'Final Eq':>10} {'B&H Eq':>10}",
+        "─" * 52,
+    ]
+    for name in MODEL_NAMES:
+        if name not in agg_metrics:
+            continue
+        m = agg_metrics[name]
+        lines.append(
+            f"{name:<12} "
+            f"{m['sharpe']:>8.2f} "
+            f"{m['mdd']:>+9.2%} "
+            f"{m['final']:>10.3f} "
+            f"{m['bh_final']:>10.3f}"
+        )
+    ax_txt.text(0.02, 0.98, "\n".join(lines), va="top",
+                family="monospace", fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Backtest saved → {out_path}")
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # 9.  MAIN
 # ═════════════════════════════════════════════════════════════════════════════
@@ -694,7 +836,27 @@ def main():
         print(f"  {name:<12} {np.mean(accs):>8.2%} "
               f"{np.mean(aucs):>8.3f} {np.mean(edges):>+9.2%}")
 
+    print("\n[BACKTEST] Long/flat signal vs buy-and-hold (test period)")
+    print(f"  {'Model':<12} {'Sharpe':>8} {'MaxDD':>9} {'Final Eq':>10} {'B&H Eq':>10}")
+    print(f"  {'─'*52}")
+    for name in MODEL_NAMES:
+        sharpes, mdds, finals, bh_finals = [], [], [], []
+        for s in all_stocks:
+            bt = s["results"][name].get("backtest")
+            if not bt or len(bt["equity"]) == 0:
+                continue
+            sharpes.append(bt["sharpe"])
+            mdds.append(bt["max_drawdown"])
+            finals.append(bt["final"])
+            bh_finals.append(bt["benchmark_final"])
+        if not sharpes:
+            continue
+        print(f"  {name:<12} {np.nanmean(sharpes):>8.2f} "
+              f"{np.nanmean(mdds):>+9.2%} {np.nanmean(finals):>10.3f} "
+              f"{np.nanmean(bh_finals):>10.3f}")
+
     plot_comparison(all_stocks, out_path="model_comparison.png")
+    plot_backtests(all_stocks, out_path="model_backtests.png")
     print("\nDone.")
 
 
